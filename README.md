@@ -32,19 +32,11 @@ tfh-tr1-sccuttag-multiome/
 ├── README.md
 ├── analysis/
 │   ├── 01_preprocessing.Rmd
-│   ├── 02_rna_annotation.Rmd
-│   ├── 03_cuttag_consensus.Rmd
-│   ├── 04_pseudobulk_sensitivity.Rmd
-│   ├── 05_balanced_resampling.Rmd
-│   └── 06_figures_tables.Rmd
+│   ├── 02_thesis_analysis.Rmd
 ├── config/
 │   └── paths.example.R
 ├── data/
 │   └── README.md
-├── figures/
-├── results/
-│   ├── objects/
-│   └── tables/
 └── sessionInfo.txt
 ```
 
