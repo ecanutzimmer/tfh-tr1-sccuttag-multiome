@@ -37,7 +37,6 @@ tfh-tr1-sccuttag-multiome/
 │   └── paths.example.R
 ├── data/
 │   └── README.md
-└── sessionInfo.txt
 ```
 
 The current analysis was originally developed in a single exploratory R Markdown notebook. The repository version should separate stable thesis analyses from exploratory or abandoned analyses so that the public workflow reflects the final thesis conclusions.
