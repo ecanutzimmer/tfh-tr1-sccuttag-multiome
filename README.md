@@ -132,22 +132,8 @@ For stronger reproducibility, an `renv.lock` file can also be generated with `re
 
 Because the raw sequencing data and large intermediate objects are not stored in the repository, the public repository documents and reproduces the computational workflow provided that the required input data are available locally.
 
-## Scope of the public code
-
-The repository is intended to reflect the **final analytical scope of the thesis**. Exploratory analyses that were not used to support the final conclusions, including preliminary promoter-level aggregation, motif-enrichment experiments, and cross-TF co-binding analyses based on unstable differential peak sets, should not be part of the main reproducible pipeline. If retained for provenance, they should be placed in a clearly labeled `archive/` directory and should not be presented as final analyses.
-
-## Citation
-
-If you use or adapt this workflow, please cite the associated thesis:
-
-> Canut Zimmermann, E. (2026). *Gene regulatory networks driving TFH-to-TR1 transdifferentiation using single-cell multiome and single-cell CUT&Tag* [Master's thesis]. Master's Degree in Health Data Science.
-
 ## Author
 
 **Enric Canut Zimmermann**  
 Master's Degree in Health Data Science  
 Barcelona, 2026
-
-## License
-
-A software license has not been assigned here. Before adding one, confirm any institutional or collaborative requirements governing redistribution of the analysis code.
