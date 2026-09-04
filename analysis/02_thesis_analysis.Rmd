@@ -1,0 +1,831 @@
+---
+title: "TFH-to-TR1 scCUT&Tag multiome analysis"
+author: "Enric Canut Zimmermann"
+output: html_document
+---
+
+# Purpose
+
+This notebook contains the analyses that directly support the final Master's thesis. It starts from QC-filtered multimodal Seurat objects and excludes exploratory analyses that were not retained in the final interpretation (promoter-level aggregation, motif enrichment, and cross-TF co-binding).
+
+# 1. Setup
+
+```{r setup, warning=FALSE, message=FALSE}
+library(Seurat)
+library(Signac)
+library(Matrix)
+library(GenomicRanges)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(qs)
+
+set.seed(123)
+
+genome_name <- "mm10"
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevels(annotation) <- paste0("chr", seqlevels(annotation))
+genome(annotation) <- genome_name
+
+state_order <- c("TFH", "TR1.1", "TR1.2", "Foxp3+TR1.2")
+state_order_with_undefined <- c(state_order, "Undefined")
+
+state_cols <- c(
+  "TFH" = "#F8766D",
+  "TR1.1" = "#7CAE00",
+  "TR1.2" = "#00BFC4",
+  "Foxp3+TR1.2" = "#C77CFF",
+  "Undefined" = "grey54"
+)
+
+# Adjust these paths locally if required.
+data_dir <- file.path("data", "sp20_21", "relaxed", "rna")
+reference_atlas_path <- file.path("data", "ctls_only_obj_260126.qs")
+
+input_files <- c(
+  Bcl6 = file.path(data_dir, "joint_Bcl6_filt_100726.qs"),
+  Irf4 = file.path(data_dir, "joint_Irf4_filt_100726.qs"),
+  Maf  = file.path(data_dir, "joint_Maf_filt_100726.qs")
+)
+
+dir.create("figures", recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path("results", "tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path("results", "objects"), recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Load QC-filtered multimodal objects
+
+```{r load-objects}
+tf_objects <- lapply(input_files, qread)
+stopifnot(identical(names(tf_objects), c("Bcl6", "Irf4", "Maf")))
+
+atlas <- qread(reference_atlas_path)
+atlas@meta.data <- atlas@meta.data %>%
+  mutate(
+    pops = case_when(
+      celltype == "TFH" ~ "TFH",
+      celltype == "TR1-like" ~ "TR1.1",
+      celltype == "TR1" ~ "TR1.2",
+      celltype == "Foxp3+TR1" ~ "Foxp3+TR1.2",
+      TRUE ~ NA_character_
+    )
+  )
+DefaultAssay(atlas) <- "integrated"
+```
+
+# 3. RNA normalization and reference-based cell-state annotation
+
+```{r rna-annotation}
+for (tf in names(tf_objects)) {
+  current_obj <- tf_objects[[tf]]
+  DefaultAssay(current_obj) <- "RNA"
+
+  current_obj <- NormalizeData(current_obj, verbose = FALSE)
+  current_obj <- FindVariableFeatures(current_obj, verbose = FALSE)
+  current_obj <- ScaleData(current_obj, verbose = FALSE)
+  current_obj <- RunPCA(current_obj, verbose = FALSE)
+
+  anchors <- FindTransferAnchors(
+    reference = atlas,
+    query = current_obj,
+    dims = 1:30,
+    reference.reduction = "pca",
+    verbose = FALSE
+  )
+
+  predictions <- TransferData(
+    anchorset = anchors,
+    refdata = atlas$pops,
+    dims = 1:30,
+    verbose = FALSE
+  )
+
+  current_obj <- AddMetaData(current_obj, metadata = predictions)
+  current_obj$celltype <- as.character(current_obj$predicted.id)
+  current_obj$celltype[current_obj$prediction.score.max < 0.5] <- "Undefined"
+  current_obj$celltype <- factor(
+    current_obj$celltype,
+    levels = state_order_with_undefined
+  )
+
+  current_obj <- RunUMAP(
+    current_obj,
+    reduction = "pca",
+    dims = 1:30,
+    reduction.name = "umap_rna",
+    verbose = FALSE
+  )
+
+  tf_objects[[tf]] <- current_obj
+}
+```
+
+# 4. State-specific gene-signature scoring
+
+```{r module-scores}
+gene_signatures <- list(
+  TFH = c(
+    "Art2b", "Ascl2", "Bcl6", "Cdc25b", "Cxcr5", "Cxxc5", "Id3", "Il4",
+    "Matk", "Nav2", "Nfia", "Ntrk3", "Pdcd1", "Pde2a", "Ppp1r14b", "Prag1",
+    "Rgcc", "Tox2"
+  ),
+  TR1.1 = c(
+    "Ahnak", "Ccr7", "Cd200", "Cd226", "Dapl1", "Edn3", "Emp3", "Gm2682",
+    "Klf2", "Nrn1", "Rasa3", "Rasgrp2", "S100a6", "S1pr1", "Vim", "Zbtb32"
+  ),
+  TR1.2 = c(
+    "Adam19", "Arl5a", "Coro2a", "Cxcr6", "Gimap7", "Il10", "Nkg7", "Ppp3ca",
+    "Prdm1", "Rgs1", "S100a6"
+  ),
+  `Foxp3+TR1.2` = c(
+    "Ccl5", "Ccr2", "Csf1", "Fgl2", "Foxp3", "Gzmb", "Hip1", "Nkg7", "S100a4"
+  )
+)
+
+for (tf in names(tf_objects)) {
+  current_obj <- tf_objects[[tf]]
+  DefaultAssay(current_obj) <- "RNA"
+
+  current_obj <- AddModuleScore(
+    current_obj,
+    features = gene_signatures,
+    name = "SigScore_"
+  )
+
+  current_obj$TFH_Score <- current_obj$SigScore_1
+  current_obj$TR1.1_Score <- current_obj$SigScore_2
+  current_obj$TR1.2_Score <- current_obj$SigScore_3
+  current_obj$Foxp3_TR1.2_Score <- current_obj$SigScore_4
+
+  tf_objects[[tf]] <- current_obj
+}
+```
+
+# 5. CUT&Tag TF-IDF normalization and LSI
+
+```{r cuttag-lsi}
+lsi_params <- list(
+  Bcl6 = list(n_svd = 9, umap_dims = 2:9),
+  Irf4 = list(n_svd = 9, umap_dims = 2:9),
+  Maf  = list(n_svd = 3, umap_dims = 2:3)
+)
+
+for (tf in names(tf_objects)) {
+  current_obj <- tf_objects[[tf]]
+  pars <- lsi_params[[tf]]
+
+  DefaultAssay(current_obj) <- "peaks"
+  current_obj <- RunTFIDF(current_obj, verbose = FALSE)
+  current_obj <- FindTopFeatures(
+    current_obj,
+    min.cutoff = "q5",
+    verbose = FALSE
+  )
+  current_obj <- RunSVD(current_obj, n = pars$n_svd, verbose = FALSE)
+  current_obj <- RunUMAP(
+    current_obj,
+    reduction = "lsi",
+    dims = pars$umap_dims,
+    reduction.name = "umap_cuttag",
+    verbose = FALSE
+  )
+
+  tf_objects[[tf]] <- current_obj
+}
+```
+
+# 6. Build the shared consensus peak reference
+
+```{r consensus-peaks}
+original_peak_ranges <- lapply(
+  tf_objects,
+  function(x) granges(x[["peaks"]])
+)
+
+consensus_peaks_unfiltered <- reduce(
+  unlist(GRangesList(original_peak_ranges))
+)
+
+peak_width_summary <- summary(width(consensus_peaks_unfiltered))
+peak_width_quantiles <- quantile(
+  width(consensus_peaks_unfiltered),
+  probs = c(0.90, 0.95, 0.99, 0.999)
+)
+
+n_over_2kb <- sum(width(consensus_peaks_unfiltered) > 2000)
+pct_over_2kb <- 100 * n_over_2kb / length(consensus_peaks_unfiltered)
+
+consensus_peaks <- consensus_peaks_unfiltered[
+  width(consensus_peaks_unfiltered) <= 2000
+]
+
+common_counts <- lapply(names(tf_objects), function(tf) {
+  FeatureMatrix(
+    fragments = Fragments(tf_objects[[tf]][["peaks"]]),
+    features = consensus_peaks,
+    cells = colnames(tf_objects[[tf]])
+  )
+})
+names(common_counts) <- names(tf_objects)
+
+for (tf in names(tf_objects)) {
+  tf_objects[[tf]][["peaks_common"]] <- CreateChromatinAssay(
+    counts = common_counts[[tf]],
+    fragments = Fragments(tf_objects[[tf]][["peaks"]]),
+    genome = genome_name,
+    annotation = annotation,
+    min.cells = 0,
+    min.features = 0
+  )
+}
+
+# Retain a region when it is detected in at least one cell in at least one TF dataset.
+keep_peak <- Reduce(
+  `|`,
+  lapply(tf_objects, function(x) {
+    mat <- GetAssayData(x, assay = "peaks_common", slot = "counts")
+    Matrix::rowSums(mat > 0) >= 1
+  })
+)
+
+consensus_peaks_final <- consensus_peaks[keep_peak]
+consensus_names <- GRangesToString(consensus_peaks_final)
+
+for (tf in names(tf_objects)) {
+  tf_objects[[tf]][["peaks_common"]] <- subset(
+    tf_objects[[tf]][["peaks_common"]],
+    features = consensus_names
+  )
+}
+
+stopifnot(length(unique(vapply(
+  tf_objects,
+  function(x) nrow(x[["peaks_common"]]),
+  numeric(1)
+))) == 1)
+```
+
+# 7. Pseudobulk coverage characteristics
+
+```{r pseudobulk-qc}
+pseudobulk_qc <- imap_dfr(tf_objects, function(current_obj, tf_name) {
+  current_obj <- subset(current_obj, subset = celltype != "Undefined")
+  DefaultAssay(current_obj) <- "peaks_common"
+
+  pb_counts <- AggregateExpression(
+    current_obj,
+    assays = "peaks_common",
+    group.by = "celltype",
+    slot = "counts",
+    return.seurat = FALSE
+  )$peaks_common
+
+  n_cells <- table(current_obj$celltype)
+  total_peak_counts <- colSums(pb_counts)
+  n_detected_peaks <- colSums(pb_counts > 0)
+
+  pb_cpm <- sweep(pb_counts, 2, total_peak_counts, FUN = "/") * 1e6
+  n_peaks_cpm10 <- colSums(pb_cpm > 10)
+
+  tibble(
+    TF = tf_name,
+    State = colnames(pb_counts),
+    N_cells = as.numeric(n_cells[colnames(pb_counts)]),
+    Total_peak_counts = as.numeric(total_peak_counts),
+    Counts_per_cell = as.numeric(total_peak_counts) /
+      as.numeric(n_cells[colnames(pb_counts)]),
+    N_detected_peaks = as.numeric(n_detected_peaks),
+    `N_peaks_CPM>10` = as.numeric(n_peaks_cpm10)
+  )
+}) %>%
+  mutate(State = factor(State, levels = state_order)) %>%
+  arrange(factor(TF, levels = c("Bcl6", "Irf4", "Maf")), State)
+
+write.csv(
+  pseudobulk_qc,
+  file.path("results", "tables", "Supplementary_Table_2_pseudobulk_coverage.csv"),
+  row.names = FALSE
+)
+```
+
+# 8. Pseudobulk raw-count sensitivity analysis
+
+```{r pseudobulk-sensitivity}
+comparisons <- combn(state_order, 2, simplify = FALSE)
+pseudobulk_peak_tables <- list()
+
+for (tf in names(tf_objects)) {
+  current_obj <- subset(tf_objects[[tf]], subset = celltype != "Undefined")
+  DefaultAssay(current_obj) <- "peaks_common"
+
+  pb_counts <- AggregateExpression(
+    current_obj,
+    assays = "peaks_common",
+    group.by = "celltype",
+    slot = "counts",
+    return.seurat = FALSE
+  )$peaks_common
+
+  cpm_matrix <- sweep(pb_counts, 2, colSums(pb_counts), FUN = "/") * 1e6
+
+  for (comp in comparisons) {
+    state_1 <- comp[1]
+    state_2 <- comp[2]
+
+    if (!all(c(state_1, state_2) %in% colnames(pb_counts))) next
+
+    pseudobulk_peak_tables[[paste(tf, state_1, state_2, sep = "__")]] <- tibble(
+      Peak = rownames(pb_counts),
+      TF = tf,
+      Comparison = paste0(state_1, "_vs_", state_2),
+      Count_State1 = as.numeric(pb_counts[, state_1]),
+      Count_State2 = as.numeric(pb_counts[, state_2]),
+      CPM_State1 = as.numeric(cpm_matrix[, state_1]),
+      CPM_State2 = as.numeric(cpm_matrix[, state_2]),
+      Log2FC = log2(
+        (as.numeric(cpm_matrix[, state_1]) + 1) /
+          (as.numeric(cpm_matrix[, state_2]) + 1)
+      )
+    )
+  }
+}
+
+pseudobulk_diff_table_full <- bind_rows(pseudobulk_peak_tables)
+count_thresholds <- c(1, 2, 5, 10, 20)
+
+threshold_sensitivity <- map_dfr(count_thresholds, function(min_count) {
+  pseudobulk_diff_table_full %>%
+    group_by(TF, Comparison) %>%
+    summarise(
+      Min_count = min_count,
+      N_eligible = sum(
+        Count_State1 >= min_count & Count_State2 >= min_count
+      ),
+      N_differential = sum(
+        Count_State1 >= min_count & Count_State2 >= min_count &
+          abs(Log2FC) > 1
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Pct_differential = ifelse(
+        N_eligible > 0,
+        100 * N_differential / N_eligible,
+        NA_real_
+      )
+    )
+})
+
+trajectory_comparisons <- c(
+  "TFH_vs_TR1.1",
+  "TR1.1_vs_TR1.2",
+  "TR1.2_vs_Foxp3+TR1.2"
+)
+
+threshold_sensitivity_trajectory <- threshold_sensitivity %>%
+  filter(Comparison %in% trajectory_comparisons)
+
+write.csv(
+  threshold_sensitivity_trajectory,
+  file.path("results", "tables", "threshold_sensitivity_long.csv"),
+  row.names = FALSE
+)
+```
+
+# 9. Balanced resampling: BCL6 TFH vs TR1.1
+
+This robustness analysis is intentionally restricted to the representative BCL6 TFH-versus-TR1.1 comparison used in the final thesis.
+
+```{r balanced-resampling}
+bcl6_balanced <- subset(
+  tf_objects[["Bcl6"]],
+  subset = celltype %in% c("TFH", "TR1.1") & nCount_peaks_common > 0
+)
+DefaultAssay(bcl6_balanced) <- "peaks_common"
+
+counts_mat <- GetAssayData(
+  bcl6_balanced,
+  assay = "peaks_common",
+  slot = "counts"
+)
+
+cells_tfh <- WhichCells(bcl6_balanced, expression = celltype == "TFH")
+cells_tr11 <- WhichCells(bcl6_balanced, expression = celltype == "TR1.1")
+
+detection_support <- tibble(
+  Peak = rownames(counts_mat),
+  N_detected_TFH = Matrix::rowSums(counts_mat[, cells_tfh, drop = FALSE] > 0),
+  N_detected_TR11 = Matrix::rowSums(counts_mat[, cells_tr11, drop = FALSE] > 0)
+) %>%
+  mutate(
+    Pct_detected_TFH = 100 * N_detected_TFH / length(cells_tfh),
+    Pct_detected_TR11 = 100 * N_detected_TR11 / length(cells_tr11)
+  )
+
+run_balanced_resampling <- function(
+    counts_mat,
+    cells_state1,
+    cells_state2,
+    min_cell_support,
+    sampling_fraction = 0.80,
+    n_iterations = 100,
+    seed = 123
+) {
+  eligible <- detection_support %>%
+    filter(
+      N_detected_TFH >= min_cell_support |
+        N_detected_TR11 >= min_cell_support
+    ) %>%
+    pull(Peak)
+
+  filtered_mat <- counts_mat[eligible, , drop = FALSE]
+  n_sample <- floor(
+    sampling_fraction * min(length(cells_state1), length(cells_state2))
+  )
+
+  set.seed(seed)
+  iterations <- vector("list", n_iterations)
+
+  for (i in seq_len(n_iterations)) {
+    sampled_1 <- sample(cells_state1, n_sample, replace = FALSE)
+    sampled_2 <- sample(cells_state2, n_sample, replace = FALSE)
+
+    counts_1 <- Matrix::rowSums(filtered_mat[, sampled_1, drop = FALSE])
+    counts_2 <- Matrix::rowSums(filtered_mat[, sampled_2, drop = FALSE])
+
+    # Library sizes are calculated from the complete common peak feature space.
+    library_1 <- sum(counts_mat[, sampled_1, drop = FALSE])
+    library_2 <- sum(counts_mat[, sampled_2, drop = FALSE])
+
+    cpm_1 <- counts_1 / library_1 * 1e6
+    cpm_2 <- counts_2 / library_2 * 1e6
+
+    iterations[[i]] <- tibble(
+      Peak = names(counts_1),
+      Iteration = i,
+      Count_TFH = as.numeric(counts_1),
+      Count_TR11 = as.numeric(counts_2),
+      CPM_TFH = as.numeric(cpm_1),
+      CPM_TR11 = as.numeric(cpm_2),
+      # Positive values indicate higher occupancy in TR1.1.
+      Log2FC = log2((cpm_2 + 1) / (cpm_1 + 1))
+    )
+  }
+
+  long <- bind_rows(iterations)
+
+  summary <- long %>%
+    group_by(Peak) %>%
+    summarise(
+      Median_log2FC = median(Log2FC, na.rm = TRUE),
+      Q1_log2FC = quantile(Log2FC, 0.25, na.rm = TRUE),
+      Q3_log2FC = quantile(Log2FC, 0.75, na.rm = TRUE),
+      Pct_iterations_FC_gt1 = 100 * mean(Log2FC > 1),
+      Pct_iterations_FC_lt_minus1 = 100 * mean(Log2FC < -1),
+      .groups = "drop"
+    ) %>%
+    left_join(detection_support, by = "Peak")
+
+  candidates <- summary %>%
+    filter(
+      abs(Median_log2FC) > 1,
+      Pct_iterations_FC_gt1 >= 80 |
+        Pct_iterations_FC_lt_minus1 >= 80
+    ) %>%
+    mutate(
+      Direction = case_when(
+        Pct_iterations_FC_gt1 >= 80 ~ "Higher in TR1.1",
+        Pct_iterations_FC_lt_minus1 >= 80 ~ "Higher in TFH"
+      ),
+      Max_detected_cells = pmax(N_detected_TFH, N_detected_TR11)
+    )
+
+  list(
+    minimum_support = min_cell_support,
+    eligible_peaks = eligible,
+    long = long,
+    summary = summary,
+    candidates = candidates
+  )
+}
+
+resampling_3 <- run_balanced_resampling(
+  counts_mat,
+  cells_tfh,
+  cells_tr11,
+  min_cell_support = 3
+)
+
+resampling_5 <- run_balanced_resampling(
+  counts_mat,
+  cells_tfh,
+  cells_tr11,
+  min_cell_support = 5
+)
+
+balanced_table_A <- bind_rows(
+  tibble(
+    `Minimum cell support` = ">=3 cells",
+    `Eligible peaks` = length(resampling_3$eligible_peaks),
+    `Reproducible candidates` = nrow(resampling_3$candidates),
+    `Higher in TFH` = sum(resampling_3$candidates$Direction == "Higher in TFH"),
+    `Higher in TR1.1` = sum(resampling_3$candidates$Direction == "Higher in TR1.1")
+  ),
+  tibble(
+    `Minimum cell support` = ">=5 cells",
+    `Eligible peaks` = length(resampling_5$eligible_peaks),
+    `Reproducible candidates` = nrow(resampling_5$candidates),
+    `Higher in TFH` = sum(resampling_5$candidates$Direction == "Higher in TFH"),
+    `Higher in TR1.1` = sum(resampling_5$candidates$Direction == "Higher in TR1.1")
+  )
+)
+
+balanced_table_B <- resampling_5$candidates %>%
+  mutate(
+    `Maximum cellular support` = case_when(
+      Max_detected_cells >= 20 ~ ">=20 cells",
+      Max_detected_cells >= 10 ~ "10-19 cells",
+      Max_detected_cells >= 7 ~ "7-9 cells",
+      TRUE ~ "5-6 cells"
+    ),
+    `Maximum cellular support` = factor(
+      `Maximum cellular support`,
+      levels = c("5-6 cells", "7-9 cells", "10-19 cells", ">=20 cells")
+    )
+  ) %>%
+  count(`Maximum cellular support`, name = `Number of candidates`) %>%
+  mutate(
+    `Percentage of candidates` = round(
+      100 * `Number of candidates` / sum(`Number of candidates`),
+      1
+    )
+  )
+
+write.csv(
+  balanced_table_A,
+  file.path("results", "tables", "Supplementary_Table_4A_balanced_resampling.csv"),
+  row.names = FALSE
+)
+write.csv(
+  balanced_table_B,
+  file.path("results", "tables", "Supplementary_Table_4B_cellular_support.csv"),
+  row.names = FALSE
+)
+```
+
+# 10. Thesis figures
+
+## Figure 4A: reference-mapped cellular states
+
+```{r figure-4a}
+umap_plots <- imap(tf_objects, function(obj, tf) {
+  DimPlot(
+    obj,
+    group.by = "celltype",
+    reduction = "umap_rna",
+    cols = state_cols,
+    pt.size = 0.8
+  ) +
+    ggtitle(toupper(tf)) +
+    labs(x = "UMAP 1", y = "UMAP 2")
+})
+
+figure_4a <- wrap_plots(umap_plots, nrow = 1, guides = "collect") &
+  theme(legend.position = "bottom")
+
+figure_4a
+```
+
+## Figure 4B: state-specific module scores
+
+```{r figure-4b}
+score_features <- c(
+  "TFH_Score",
+  "TR1.1_Score",
+  "TR1.2_Score",
+  "Foxp3_TR1.2_Score"
+)
+score_titles <- c(
+  "TFH signature",
+  "TR1.1 signature",
+  "TR1.2 signature",
+  "Foxp3+TR1.2 signature"
+)
+
+feature_panels <- imap(tf_objects, function(obj, tf) {
+  plots <- map2(score_features, score_titles, function(feature, title) {
+    FeaturePlot(
+      obj,
+      features = feature,
+      reduction = "umap_rna",
+      cols = c("lightgrey", "red"),
+      order = TRUE
+    ) +
+      ggtitle(title) +
+      labs(x = "UMAP 1", y = "UMAP 2")
+  })
+
+  wrap_plots(plots, ncol = 2) +
+    plot_annotation(title = toupper(tf))
+})
+
+figure_4b <- wrap_plots(feature_panels, nrow = 1)
+figure_4b
+```
+
+## Figure 5: state-specific gene-expression dot plots
+
+```{r figure-5}
+signature_genes <- unique(unlist(gene_signatures, use.names = FALSE))
+
+dotplots <- imap(tf_objects, function(obj, tf) {
+  DefaultAssay(obj) <- "RNA"
+  obj$celltype <- factor(obj$celltype, levels = state_order_with_undefined)
+
+  DotPlot(
+    obj,
+    features = signature_genes,
+    group.by = "celltype",
+    cols = "RdBu"
+  ) +
+    coord_flip() +
+    ggtitle(toupper(tf)) +
+    labs(x = NULL, y = NULL) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+})
+
+figure_5 <- wrap_plots(dotplots, nrow = 1, guides = "collect") +
+  plot_annotation(tag_levels = "A")
+figure_5
+```
+
+## Figure 6: consensus peak set and pseudobulk coverage
+
+```{r figure-6}
+tf_peak_colors <- c(
+  "Bcl6" = "#E64B35",
+  "Irf4" = "#4DBBD5",
+  "Maf" = "#00A087",
+  "Union (consensus)" = "#8491B4"
+)
+
+peak_width_df <- bind_rows(
+  imap_dfr(original_peak_ranges, function(gr, tf) {
+    tibble(TF = tf, Width = width(gr))
+  }),
+  tibble(
+    TF = "Union (consensus)",
+    Width = width(consensus_peaks_unfiltered)
+  )
+)
+
+plot_a <- ggplot(peak_width_df, aes(Width, fill = TF, color = TF)) +
+  geom_density(alpha = 0.3, linewidth = 0.7) +
+  geom_vline(xintercept = 2000, linetype = "dashed") +
+  scale_x_log10(labels = comma) +
+  scale_fill_manual(values = tf_peak_colors) +
+  scale_color_manual(values = tf_peak_colors) +
+  labs(
+    title = "Peak width distribution per transcription factor",
+    x = "Peak width (bp, log10 scale)",
+    y = "Density"
+  ) +
+  theme_classic()
+
+cell_count_df <- pseudobulk_qc %>%
+  transmute(TF, State, N_cells)
+
+plot_b <- ggplot(cell_count_df, aes(State, N_cells, fill = State)) +
+  geom_col(color = "black", linewidth = 0.3, width = 0.7) +
+  geom_text(aes(label = comma(N_cells)), vjust = -0.4, size = 3) +
+  facet_wrap(~TF, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = state_cols) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Cell numbers per state", x = NULL, y = "Cells per pseudobulk") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+plot_c <- ggplot(
+  pseudobulk_qc,
+  aes(State, N_detected_peaks, fill = State)
+) +
+  geom_col(color = "black", linewidth = 0.3, width = 0.7) +
+  geom_text(aes(label = comma(N_detected_peaks)), vjust = -0.4, size = 3) +
+  facet_wrap(~TF, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = state_cols) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Detected consensus peaks per cell-state pseudobulk",
+    x = NULL,
+    y = "Consensus peaks with detected CUT&Tag signal"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+figure_6 <- (plot_a / plot_b / plot_c) + plot_annotation(tag_levels = "A")
+figure_6
+
+ggsave(
+  file.path("figures", "Figure_6_consensus_peakset_and_coverage.png"),
+  figure_6,
+  width = 10.5,
+  height = 12,
+  dpi = 300
+)
+```
+
+# 11. Supplementary threshold-sensitivity figure and compact table
+
+```{r supplementary-thresholds}
+supp_fig_3a <- ggplot(
+  threshold_sensitivity_trajectory,
+  aes(Min_count, N_eligible, group = Comparison)
+) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~TF, scales = "free_y") +
+  scale_x_continuous(breaks = count_thresholds) +
+  labs(
+    x = "Minimum pseudobulk counts required in both states",
+    y = "Eligible peaks"
+  ) +
+  theme_classic()
+
+supp_fig_3b <- ggplot(
+  threshold_sensitivity_trajectory,
+  aes(Min_count, Pct_differential, group = Comparison)
+) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~TF, scales = "free_y") +
+  scale_x_continuous(breaks = count_thresholds) +
+  labs(
+    x = "Minimum pseudobulk counts required in both states",
+    y = "Differential peaks among eligible peaks (%)"
+  ) +
+  theme_classic()
+
+supp_figure_3 <- supp_fig_3a / supp_fig_3b + plot_annotation(tag_levels = "A")
+
+ggsave(
+  file.path("figures", "Supplementary_Figure_3_threshold_sensitivity.png"),
+  supp_figure_3,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+supp_table_3 <- threshold_sensitivity_trajectory %>%
+  mutate(
+    Threshold = ifelse(Min_count == 1, ">=1 count", paste0(">=", Min_count, " counts")),
+    Result = ifelse(
+      N_eligible > 0,
+      paste0(N_eligible, " / ", N_differential, " (", round(Pct_differential, 1), "%)"),
+      "0 / 0"
+    )
+  ) %>%
+  select(TF, Comparison, Threshold, Result) %>%
+  pivot_wider(names_from = Threshold, values_from = Result)
+
+write.csv(
+  supp_table_3,
+  file.path("results", "tables", "Supplementary_Table_3_threshold_sensitivity.csv"),
+  row.names = FALSE
+)
+```
+
+# 12. Save final analysis objects and reproducibility information
+
+```{r save-results}
+saveRDS(
+  tf_objects,
+  file.path("results", "objects", "tf_objects_final.rds")
+)
+saveRDS(
+  consensus_peaks_final,
+  file.path("results", "objects", "consensus_peaks_final.rds")
+)
+saveRDS(
+  resampling_3,
+  file.path("results", "objects", "balanced_resampling_3cells.rds")
+)
+saveRDS(
+  resampling_5,
+  file.path("results", "objects", "balanced_resampling_5cells.rds")
+)
+
+writeLines(capture.output(sessionInfo()), "sessionInfo.txt")
+```

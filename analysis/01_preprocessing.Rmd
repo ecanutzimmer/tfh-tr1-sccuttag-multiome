@@ -1,0 +1,293 @@
+---
+title: "TFH-to-TR1 multimodal preprocessing"
+author: "Enric Canut Zimmermann"
+output: html_document
+---
+
+# Purpose
+
+This notebook contains the stable preprocessing steps used to build QC-filtered multimodal Seurat objects from TF-specific single-cell CUT&Tag and matched gene-expression data. Exploratory QC plots and abandoned analysis branches from the development notebook have been removed.
+
+# 1. Setup
+
+```{r setup, warning=FALSE, message=FALSE}
+library(Signac)
+library(Seurat)
+library(Matrix)
+library(GenomicRanges)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(dplyr)
+library(ggplot2)
+library(qs)
+
+genome_name <- "mm10"
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevels(annotation) <- paste0("chr", seqlevels(annotation))
+genome(annotation) <- genome_name
+
+samples <- c("Bcl6", "Irf4", "Maf")
+min_cells_assay <- 1
+min_features_assay <- 0
+
+project_data <- file.path("data", "sp20_21")
+ct_root <- file.path(project_data, "relaxed", "scCT")
+rna_root <- file.path(project_data, "relaxed", "rna")
+
+sample_dirs <- setNames(
+  file.path(ct_root, samples),
+  samples
+)
+
+rna_dirs <- setNames(
+  file.path(rna_root, samples),
+  samples
+)
+
+dir.create(rna_root, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path("figures", "qc"), recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Load TF-specific peak calls and cell metadata
+
+```{r load-cuttag-inputs}
+peak_ranges <- list()
+metadata <- list()
+fragments <- list()
+
+for (tf in samples) {
+  peak_file <- file.path(sample_dirs[[tf]], "macs2_permissive_peaks.narrowPeak")
+  metadata_file <- file.path(sample_dirs[[tf]], "picked_cellsmetadata_f.csv")
+  fragment_file <- file.path(sample_dirs[[tf]], "fragments.tsv.gz")
+
+  stopifnot(
+    file.exists(peak_file),
+    file.exists(metadata_file),
+    file.exists(fragment_file)
+  )
+
+  peak_df <- read.table(peak_file)[, 1:3]
+  colnames(peak_df) <- c("chr", "start", "end")
+  peak_ranges[[tf]] <- reduce(makeGRangesFromDataFrame(peak_df))
+
+  meta <- read.csv(metadata_file, stringsAsFactors = FALSE)
+  stopifnot("barcode" %in% colnames(meta))
+  rownames(meta) <- meta$barcode
+  metadata[[tf]] <- meta
+
+  fragments[[tf]] <- CreateFragmentObject(
+    path = fragment_file,
+    cells = meta$barcode
+  )
+}
+```
+
+# 3. Initial permissive CUT&Tag quantification
+
+The development workflow used a pooled permissive reference at this preprocessing stage. A final shared consensus reference is rebuilt after RNA-based state annotation and QC in the thesis-analysis notebook.
+
+```{r initial-cuttag-quantification}
+initial_union_peaks <- reduce(unlist(GRangesList(peak_ranges)))
+
+cuttag_objects <- list()
+
+for (tf in samples) {
+  counts <- FeatureMatrix(
+    fragments = fragments[[tf]],
+    features = initial_union_peaks,
+    cells = metadata[[tf]]$barcode,
+    process_n = 20000
+  )
+
+  chrom_assay <- CreateChromatinAssay(
+    counts = counts,
+    fragments = fragments[[tf]],
+    genome = genome_name,
+    min.cells = min_cells_assay,
+    min.features = min_features_assay,
+    annotation = annotation
+  )
+
+  cuttag_objects[[tf]] <- CreateSeuratObject(
+    counts = chrom_assay,
+    assay = "peaks",
+    meta.data = metadata[[tf]],
+    project = tf
+  )
+
+  cuttag_objects[[tf]]$sample <- tf
+}
+```
+
+# 4. Map CUT&Tag barcodes to matched gene-expression barcodes
+
+```{r barcode-translation}
+atac_whitelist_path <- file.path(project_data, "scCT", "737K-arc-v1.txt.gz")
+gex_whitelist_path <- file.path(project_data, "rna", "737K-arc-v1.txt.gz")
+
+atac_whitelist <- readLines(gzfile(atac_whitelist_path))
+gex_whitelist <- readLines(gzfile(gex_whitelist_path))
+stopifnot(length(atac_whitelist) == length(gex_whitelist))
+
+barcode_translation <- data.frame(
+  ATAC_barcode = paste0(atac_whitelist, "-1"),
+  GEX_barcode = paste0(gex_whitelist, "-1"),
+  stringsAsFactors = FALSE
+)
+```
+
+# 5. Build matched multimodal Seurat objects
+
+```{r build-joint-objects}
+for (tf in samples) {
+  rna_raw <- Read10X(data.dir = rna_dirs[[tf]])
+  ct_obj <- cuttag_objects[[tf]]
+
+  peak_ranges_std <- keepStandardChromosomes(
+    granges(ct_obj[["peaks"]]),
+    pruning.mode = "coarse"
+  )
+  ct_obj <- subset(
+    ct_obj,
+    features = GRangesToString(peak_ranges_std),
+    assay = "peaks"
+  )
+
+  old_cells <- Cells(ct_obj[["peaks"]])
+  matches <- match(old_cells, barcode_translation$ATAC_barcode)
+
+  if (anyNA(matches)) {
+    warning(sum(is.na(matches)), " CUT&Tag barcodes did not match the ARC whitelist for ", tf)
+  }
+
+  keep <- !is.na(matches)
+  ct_obj <- subset(ct_obj, cells = old_cells[keep])
+  new_cells <- barcode_translation$GEX_barcode[matches[keep]]
+  ct_assay <- RenameCells(ct_obj[["peaks"]], new.names = new_cells)
+
+  master_cells <- intersect(Cells(ct_assay), colnames(rna_raw))
+  message(tf, ": ", length(master_cells), " matched multimodal barcodes")
+
+  rna_sub <- rna_raw[, master_cells, drop = FALSE]
+  joint <- CreateSeuratObject(counts = rna_sub, project = tf)
+
+  ct_counts <- GetAssayData(ct_assay, slot = "counts")[, master_cells, drop = FALSE]
+  joint[["peaks"]] <- CreateChromatinAssay(
+    counts = ct_counts,
+    ranges = granges(ct_assay),
+    fragments = Fragments(ct_assay)
+  )
+
+  joint$sampletype <- paste0("multi.", tf)
+  qsave(joint, file.path(rna_root, paste0("joint_", tf, "_relaxed.qs")))
+}
+```
+
+# 6. Add QC metrics
+
+```{r qc-metrics}
+for (tf in samples) {
+  input_file <- file.path(rna_root, paste0("joint_", tf, "_relaxed.qs"))
+  obj <- qread(input_file)
+
+  DefaultAssay(obj) <- "RNA"
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+  obj[["percent.rb"]] <- PercentageFeatureSet(obj, pattern = "^Rp")
+
+  qsave(obj, file.path(rna_root, paste0("joint_", tf, "_QC_added.qs")))
+}
+```
+
+# 7. Apply final RNA QC thresholds
+
+```{r final-qc-filtering}
+qc_params <- list(
+  Bcl6 = list(min_rna = 450, max_rna = 10000, max_features = 7500, max_mt = 3),
+  Irf4 = list(min_rna = 450, max_rna = 10000, max_features = 7500, max_mt = 3),
+  Maf  = list(min_rna = 300, max_rna = 10000, max_features = 7500, max_mt = 3)
+)
+
+qc_summary <- list()
+
+for (tf in samples) {
+  obj <- qread(file.path(rna_root, paste0("joint_", tf, "_QC_added.qs")))
+  pars <- qc_params[[tf]]
+
+  filtered <- subset(
+    obj,
+    subset =
+      nCount_RNA > pars$min_rna &
+      nCount_RNA < pars$max_rna &
+      nFeature_RNA < pars$max_features &
+      percent.mt < pars$max_mt
+  )
+
+  qc_summary[[tf]] <- data.frame(
+    TF = tf,
+    Cells_before = ncol(obj),
+    Cells_after = ncol(filtered)
+  )
+
+  qsave(
+    filtered,
+    file.path(rna_root, paste0("joint_", tf, "_filt_100726.qs"))
+  )
+}
+
+qc_summary <- bind_rows(qc_summary)
+write.csv(qc_summary, file.path("results", "tables", "qc_cell_counts.csv"), row.names = FALSE)
+```
+
+# 8. QC plots used for the supplementary material
+
+```{r qc-plots}
+filtered_objects <- setNames(
+  lapply(samples, function(tf) {
+    qread(file.path(rna_root, paste0("joint_", tf, "_filt_100726.qs")))
+  }),
+  samples
+)
+
+for (tf in samples) {
+  obj <- filtered_objects[[tf]]
+
+  p1 <- VlnPlot(
+    obj,
+    features = c(
+      "nCount_peaks", "nFeature_peaks",
+      "nCount_RNA", "nFeature_RNA",
+      "percent.mt", "percent.rb"
+    ),
+    ncol = 3,
+    pt.size = 0
+  ) + ggtitle(paste(tf, "post-filter distributions"))
+
+  p2 <- FeatureScatter(
+    obj,
+    feature1 = "nCount_RNA",
+    feature2 = "nFeature_RNA",
+    pt.size = 0.5
+  ) + ggtitle(paste(tf, "RNA QC"))
+
+  ggsave(
+    file.path("figures", "qc", paste0("QC_", tf, "_violin.png")),
+    p1,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+  ggsave(
+    file.path("figures", "qc", paste0("QC_", tf, "_rna_scatter.png")),
+    p2,
+    width = 6,
+    height = 5,
+    dpi = 300
+  )
+}
+```
+
+# 9. Reproducibility
+
+```{r session-info}
+writeLines(capture.output(sessionInfo()), "sessionInfo_preprocessing.txt")
+```
